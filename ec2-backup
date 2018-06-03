@@ -1,0 +1,494 @@
+#!/bin/sh
+
+# Environment vairables:
+# 	EC2_BACKUP_FLAGS_AWS
+#	EC2_BACKUP_FLAGS_SSH
+#	EC2_BACKUP_VERBOSE
+
+volume_id=""
+instance_id=""
+zone=""
+dns_name=""
+ssh_flag=""
+size=0
+attach_device="/dev/sda3"
+dd_device="/dev/xbd2d"
+directory=""
+
+# Since I used NetBSD instance, and the 
+# default username is root
+user_name="root"
+
+print_verbose(){
+	if [ ! -z "$EC2_BACKUP_VERBOSE" ]; then
+		printf "$1"
+	fi
+}
+
+terminate_instance(){
+	print_verbose "Cleaning up...\n"
+
+	sentence="aws ec2 terminate-instances \
+--instance-ids $instance_id 2>&1 >/dev/null"
+
+	is_instance="echo $instance_id | grep \"i-\""
+	result=`eval $is_instance`
+
+	if [ $? -eq 0 ]; then
+		result=`eval $sentence`
+	fi
+}
+
+usage(){
+	printf "usage: ec2-backup [-h] [-l filter] [-r filter]"
+	printf " [-v volume-id] dir\n"
+}
+
+is_dir_exist(){
+	sentence="readlink -f \"$directory\""
+	directory=`eval $sentence`
+
+	print_verbose "Checking $directory exist or not...\n"
+
+	if [ -z "$directory" ] || [ ! -d "$directory" ]; then
+		printf "Invalid directory: $directory\n"  1>&2 
+		exit 1
+	fi
+}
+
+is_volume_exist(){
+	print_verbose "Checking $volume_id exist or not...\n"
+
+	sentence="aws ec2 describe-volumes --volume-ids $volume_id >/dev/null 2>&1"
+	result=`eval $sentence`
+
+	if [ $? -ne 0 ]; then
+		printf "No such volume: $volume_id\n" 1>&2
+		exit 2
+	fi
+}
+
+get_zone(){
+	print_verbose "Getting zone which suitable to attach...\n"
+
+	if [ -z "$volume_id" ]; then
+		zone_name=`aws ec2 describe-availability-zones --output text \
+--query 'AvailabilityZones[0].ZoneName'`
+	else
+		zone_name=`aws ec2 describe-volumes --volume-ids "$volume_id" \
+--output text --query 'Volumes[0].AvailabilityZone'`
+	fi
+
+	zone="$zone_name"
+}
+
+wait_instance(){
+	print_verbose "Waiting instance available to run...\n"
+
+	instance=$1
+	instance_status=""
+
+	while [ "$instance_status" != "running" ]; do
+		instance_status=`aws ec2 describe-instances \
+--output text --instance-id "$instance" \
+--query 'Reservations[0].Instances[0].State.Name'`
+
+		if [ "$instance_status" != "running" ] && 
+				[ "$instance_status" != "pending" ]; then
+			printf "Already created instance but unavailable\n" 1>&2
+
+			terminate_instance
+
+			exit 3
+		fi
+	done
+}
+
+create_instance(){
+	get_zone
+
+	image_flag=0
+
+	# Two situations:
+	# 1. without EC2_BACKUP_FLAGS_AWS, since only image-id 
+	# need to be specific, we set --image-id ami-569ed93c set
+	# by default. It has a problem, if create instance 
+	# without flag --security-group and --key-name, it may
+	# not accessible.
+	#
+	# 2. with EC2_BACKUP_FLAGS_AWS, run it. But it also has
+	# the problem above.
+	# 
+	# All in all, my approach is not to deal with this problem,
+	# let the aws utility to deal with this error and report to
+	# user. I think it is The Principle of Least Astonishment
+	#########
+	# It is also note that it only support text format, json
+	# format is a little bit difficult to handle
+	print_verbose "Creating instance...\n"
+
+	if [ -z "$EC2_BACKUP_FLAGS_AWS" ]; then
+		instance=`aws ec2 run-instances --image-id ami-569ed93c \
+--placement AvailabilityZone=$zone --instance-type t1.micro \
+--output text --query 'Instances[0].InstanceId'`
+
+		printf "Warning: it may cause problem when create instance "
+		printf "without --security-group and --key-name. You can custom "
+		printf "these in EC2_BACKUP_FLAGS_AWS\n"
+	else
+		instance=`aws ec2 run-instances --image-id ami-569ed93c \
+--placement AvailabilityZone="$zone" --instance-type t1.micro \
+--output text --query 'Instances[0].InstanceId' $EC2_BACKUP_FLAGS_AWS `
+	fi
+
+	if [ $? -ne 0 ]; then
+		printf "Cannot create instance properly\n" 1>&2
+		exit 4
+	fi
+
+	# Since the instance will take some time to set up, we 
+	# need to check current status and exit the function when
+	# the current status is running
+	wait_instance "$instance"
+
+	instance_id="$instance"
+}
+
+get_dns(){
+	print_verbose "Getting DNS address of $instance_id...\n"
+
+	dns_name=`aws ec2 describe-instances --instance-id "$instance_id" \
+--output text --query 'Reservations[0].Instances[0].PublicDnsName'`
+}
+
+# The situation of ssh is so variant, each time has different
+# result, which I cannot ensure my code below is right, so I have
+# to use this stupid solution to deal with that
+wait_connect(){
+	print_verbose "Waiting instance available for ssh connecting...\n"
+	
+	sleep 10s
+
+	status="Initial"
+
+	sentence="ssh -o StrictHostKeyChecking=no \
+$EC2_BACKUP_FLAGS_SSH $user_name@$dns_name \" \" 2>&1"
+
+	while [ -n "$status" ]; do
+		result=`eval $sentence`
+
+		status=`echo "$result"| grep "Connection refused"`
+	done
+}
+
+check_local_command(){
+	local_command=$1
+
+	print_verbose "Checking -l $local_command is ready for run or not...\n"
+
+	sentence="tar cf - $directory 2>&- | $local_command 2>&- "
+
+	result='eval $sentence' 
+
+	# Since the user may execute different command, I can only
+	# from my knowledge come up with two solutions to check if 
+	# the command is fail or not. The first one is check if there
+	# is any output of stderr, if it has, then treat the command
+	# as fail. However, this assumption is not true all the time,
+	# e.g. dd(1) will print the capture bytes to stderr when the
+	# command execute successfully. So here I chose to use the 
+	# second solution, which assume every command will return 0
+	# when the command execute successfully. I know, I know, do
+	# not make assumption, which I try to avoid doing that, but
+	# now I cannot come up with a better way to deal with that.
+	if [ $? -ne 0 ]; then
+		printf "Invalid command: -l $local_command\n" 1>&2
+
+		terminate_instance
+		exit 5
+	fi
+}
+
+check_remote_command(){
+	local_part=$1
+	remote_part=$2
+	remote_command=$3
+	
+	print_verbose "Checking -r $remote_command is ready for run or not...\n"
+
+	sentence="$local_part | $remote_part \"$remote_command 1>&- 2>&-;\
+ echo \$?; \" | awk '{print \$1}'"
+
+	get_byte="`eval $sentence`"
+
+	if [ $? -ne 0 ] || [ $get_byte -ne 0 ]; then
+		printf "Invalid command: -r $remote_command\n" 1>&2
+
+		terminate_instance
+		exit 6
+	fi
+}
+
+get_dir_size(){
+	print_verbose "Calculating the size of $directory...\n"
+
+	local_part=$1
+	remote_part=$2
+	total=""
+
+	total="$total $local_part"
+	total="$total |"
+	total="$total $remote_part"
+	total="$total dd 2>&1 1>/dev/null \" | grep bytes | awk '{print \$1}'"
+
+	get_byte=`eval $total`
+
+	if [ $? -ne 0 ]; then
+		printf "Invalid command: %s\n" "$total" 1>&2
+
+		terminate_instance
+		exit 6
+	fi
+
+	get_byte=$( expr $get_byte + 1023)
+	get_kb=$( expr $get_byte / 1024 ) 
+	get_kb=$( expr $get_kb + 1023 )
+	get_mb=$( expr $get_kb / 1024 )
+	get_mb=$( expr $get_mb + 1023 )
+	get_gb=$( expr $get_mb / 1024 )
+
+	size=$get_gb
+}
+
+wait_volume(){
+	print_verbose "Waiting volume available to attach...\n"
+
+	status=""
+
+	while [ "$status" != "available" ]; do
+		status=`aws --output text ec2 describe-volumes \
+--volume-ids "$volume_id" --query 'Volumes[0].State'`
+		
+		if [ "$status" != "creating" ] && 
+			[ "$status" != "available" ]; then
+
+			printf "Current volume is unavailable\n" 1>&2
+
+			terminate_instance
+			exit 12
+		fi	
+	done
+}
+
+create_volume(){
+	print_verbose "Creating volume...\n"
+
+	size=$1
+
+	if [ -z "$volume_id" ]; then
+		if [ $size -le 1 ]; then
+			allocate_size=2
+
+		# The maximum size of volume is 16TiB, so in case of 
+		# at least two time of directory size, the maximum directory
+		# size is 8TiB
+		elif [ 2 -le $size ] && [ $size -le 8192 ]; then
+			allocate_size=2*$size
+		else
+			printf "The target is too larget to allocated\n" 1>&2
+
+			terminate_instance
+			exit 10
+		fi
+
+		sentence="aws ec2 create-volume --output text --size \
+\$allocate_size --availability-zone \$zone --query 'VolumeId'"
+		volume_id=`eval $sentence`
+
+		if [ $? -ne 0 ]; then
+			printf "Error when create volume\n"
+
+			terminate_instance
+		fi
+	else
+		# Since different OS has different method to get free
+		# space of volume, so I just get the volume size then
+		# overwrite the data of volume
+		current_volume_size=`aws ec2 describe-volumes --output text \
+--volume-ids "$volume_id" --query 'Volumes[0].Size'`
+
+		if [ $? -ne 0 ]; then
+			printf "Error when get volume size\n"
+
+			terminate_instance
+		fi
+
+		if [ $size -gt $current_volume_size ]; then
+			printf "The directory size is larger than volume capacity\n" 1>&2
+
+			terminate_instance
+			exit 11 
+		fi
+	fi
+
+	wait_volume
+}
+
+wait_attach(){
+	print_verbose "Waiting attach finish...\n"
+
+	status=""
+
+	while [ "$status" != "attached" ]; do
+		status=`aws --output text ec2 describe-volumes \
+--volume-ids "$volume_id" --query 'Volumes[0].Attachments[0].State'`
+
+		if [ "$status" != "attaching" ] && 
+			[ "$status" != "attached" ]; then
+
+			printf "Something wrong when attaching volume to instance\n" 1>&2
+
+			terminate_instance
+			exit 13
+		fi	
+	done
+}
+
+attach_volume(){
+	print_verbose "Attaching volume to instance...\n"
+
+	sentence=" aws ec2 attach-volume --volume-id $volume_id --instance-id $instance_id \
+--device $attach_device "
+
+	result=`eval $sentence`
+
+	wait_attach 
+}
+
+backup_data(){
+	print_verbose "Backing up data...\n"
+
+	local_part=$1
+	remote_part=$2
+
+	total=""
+	total="$total $local_part"
+	total="$total |"
+	total="$total $remote_part"
+	total="$total dd of=$dd_device 1>&- 2>&- \" "
+
+	run=`eval $total`
+
+	if [ $? -ne 0 ]; then
+		printf "Backup fail: %s\n" "$run" 1>&2
+
+		terminate_instance
+		exit 14
+	fi
+}
+
+copy_data_to_volume(){
+	local_command=$1
+	remote_command=$2
+
+	get_dns
+
+	# It use to connect the remote instance at first time
+	# since it may have verification, so I just connect it
+	# with -o "StrictHostKeyChecking no" and do nothing.
+	# The reason I do not use it in later because it may
+	# disturb with the EC2_BACKUP_FLAGS_SSH
+
+	wait_connect
+
+	# Why divide into two part? Since the finally we need to transfer
+	# local output to remote, but if the local part cannot execute and 
+	# remote part is execute, the dd(1) still return more than
+	# 0 byte to stderr. So it need to make sure both local and
+	# remote part is executable then run the command 
+	if [ -z "$local_command" ]; then
+		local_part="tar cf - $directory 2>&- "
+	else
+		check_local_command "$local_command"
+		local_part="tar cf - $directory 2>&- | $local_command "
+	fi
+
+	# notice that it just add single double quote instead of 
+	# two in case of append variant command then append remain
+	# double quote at last
+
+	# Since the sh do not support arrays, I cannot spilt the user
+	# name in EC2_BACKUP_FLAGS_SSH. As a result, it cannot change
+	# the username rather than "root", I know it said that we can
+	# use "ssh $EC2_BACKUP_FLAGS_SSH" to call ssh part, but it since
+	# confilt with the test case in manual. 
+	remote_part=""
+	if [ -z "$EC2_BACKUP_FLAGS_SSH" ]; then
+		remote_part="$remote_part ssh $user_name@$dns_name "
+	else
+		remote_part="$remote_part ssh $EC2_BACKUP_FLAGS_SSH \
+$user_name@$dns_name "
+	fi
+
+	if [ -z "$remote_command" ]; then
+		remote_part="$remote_part \" "
+	else
+		check_remote_command "$local_part" "$remote_part" "$remote_command"
+
+		remote_part="$remote_part \" $remote_command | "
+	fi
+
+	get_dir_size "$local_part" "$remote_part"
+
+	create_volume "$size"
+
+	attach_volume
+
+	backup_data "$local_part" "$remote_part"
+}
+
+# Main Process
+###########################################################
+local_command=""
+remote_command=""
+
+print_verbose "Checking input...\n"
+# Add colon character as first character since
+# want program print usage instad of error meesage
+# customize the situations
+while getopts ":hl:r:v:" opt; do
+	case "$opt" in
+		h)
+			usage
+			exit 0
+			;;
+		l)
+			local_command="$OPTARG"
+			;;
+		r)
+			remote_command="$OPTARG"
+			;;
+		v)
+			volume_id="$OPTARG"
+			is_volume_exist "$volume_id"
+			;;
+		*)
+			usage 1>&2
+			exit 1
+			;;
+	esac
+done
+
+shift $(($OPTIND-1))
+directory=$1
+
+is_dir_exist
+
+create_instance
+
+copy_data_to_volume "$local_command" "$remote_command"
+
+terminate_instance
+
+printf "$volume_id\n"
+exit 0
