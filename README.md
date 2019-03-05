@@ -1,3 +1,5 @@
+Check out [this](https://stevens.netmeister.org/615/#hw) website for more detail about that project.
+
 ## Implement way:
 
 Since we need to use NetBSD to run the program and NetBSD do not
