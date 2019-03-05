@@ -1,4 +1,4 @@
-Check out [this](https://stevens.netmeister.org/615/#hw) website for more detail about that project.
+Check out [this](https://stevens.netmeister.org/615/#hw) website for more detail about the project.
 
 ## Implement way:
 
